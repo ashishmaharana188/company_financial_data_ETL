@@ -2,11 +2,15 @@
 .env
 ingestion_audit.log
 .venv/
+ingestion_audit.log
+.venv/
 env/
+pipeline_execution.log
 pipeline_execution.log
 __pycache__/
 *.py[cod]
 *$py.class
+offline_data_cache
 offline_data_cache
 .DS_Store
 Thumbs.db
@@ -16,3 +20,4 @@ offline_data_cache
 .tmp
 offline_statements
 /offline_statements
+parquet

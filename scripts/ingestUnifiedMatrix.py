@@ -495,6 +495,21 @@ def push_chunk_to_db(df, file_name="Unknown_File"):
         ]
     )
 
+    debug_row = df.filter(
+        (pl.col("Ticker") == "RELIANCE")
+        & (pl.col("ReportDate") == datetime(2026, 9, 18).date())
+    )
+
+    if not debug_row.is_empty():
+        row = debug_row.row(0, named=True)
+
+        print("[DEBUG RAW VALUES]")
+        print("Open:", repr(row["Open"]))
+        print("High:", repr(row["High"]))
+        print("Low:", repr(row["Low"]))
+        print("Close:", repr(row["Close"]))
+        print("Turnover:", repr(row["Turnover"]))
+
     # Cast Floats
     float_cols = [
         "StrikePrice",
@@ -511,6 +526,7 @@ def push_chunk_to_db(df, file_name="Unknown_File"):
         [
             pl.col(c)
             .cast(pl.Utf8)
+            .str.strip_chars()
             .str.replace_all(",", "")
             .cast(pl.Float64, strict=False)
             for c in float_cols
@@ -531,6 +547,7 @@ def push_chunk_to_db(df, file_name="Unknown_File"):
         [
             pl.col(c)
             .cast(pl.Utf8)
+            .str.strip_chars()
             .str.replace_all(",", "")
             .str.replace_all(r"\.0$", "")
             .cast(pl.Int64, strict=False)
@@ -567,6 +584,29 @@ def push_chunk_to_db(df, file_name="Unknown_File"):
 
     temp_view = f"temp_master_{uuid.uuid4().hex[:8]}"
     try:
+        debug_row = df.filter(
+            (pl.col("Ticker") == "RELIANCE")
+            & (pl.col("ReportDate") == datetime(2026, 9, 18).date())
+        )
+
+        if not debug_row.is_empty():
+            row = debug_row.row(0, named=True)
+
+            print(
+                "[DEBUG]",
+                row["Ticker"],
+                row["ReportDate"],
+                row["Open"],
+                row["High"],
+                row["Low"],
+                row["Close"],
+                row["Volume"],
+                row["Turnover"],
+                row["No_Of_Trades"],
+                row["Delivery_Qty"],
+                row["Delivery_Percentage"],
+            )
+
         arrow_table = df.to_arrow()
         engine.register(temp_view, arrow_table)
 

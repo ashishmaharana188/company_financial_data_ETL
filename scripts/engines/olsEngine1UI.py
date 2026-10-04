@@ -1,243 +1,565 @@
-import streamlit as st
-import pandas as pd
 import json
 from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+
 from scripts.database import engine
+from scripts.engines.olsEngine1 import (
+    OLSMicrostructureEngine,
+)
 
 
-def fetch_single_ticker_ledger(ticker: str, target_date: str) -> pd.DataFrame:
+ENGINE_NAME = "1_OLS_Microstructure"
+
+
+def _parse_json(value):
+
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, str):
+
+        try:
+            return json.loads(value)
+
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return {}
+
+    return {}
+
+
+def fetch_latest_market_date(
+    ticker: str,
+):
+
     query = """
-        SELECT horizon, signal, score, confidence, veto_flag, penalty, reason_json, feature_json
-        FROM prediction_ledger
-        WHERE ticker = $ticker AND asof_date = CAST($target_date AS DATE) AND engine_name = '1_OLS_Microstructure'
+        SELECT MAX(date) AS latest_date
+        FROM mv_unified_market_matrix
+        WHERE ticker = $ticker
     """
-    return engine.execute(query, {"ticker": ticker, "target_date": target_date}).df()
+
+    df = engine.execute(
+        query,
+        {
+            "ticker": ticker,
+        },
+    ).pl()
+
+    if df.is_empty():
+        return None
+
+    value = df.get_column("latest_date")[0]
+
+    if value is None:
+        return None
+
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
-def fetch_watchlist_ledger(target_date: str) -> pd.DataFrame:
+def fetch_data_readiness(
+    ticker: str,
+):
+
     query = """
-        SELECT ticker, horizon, signal, score, confidence, veto_flag, penalty
-        FROM prediction_ledger
-        WHERE asof_date = CAST($target_date AS DATE) AND engine_name = '1_OLS_Microstructure'
+        SELECT
+            COUNT(*) AS rows_total,
+            MIN(date) AS min_date,
+            MAX(date) AS max_date,
+
+            COUNT(*)
+            FILTER (
+                WHERE close IS NOT NULL
+            ) AS close_rows,
+
+            COUNT(*)
+            FILTER (
+                WHERE volume IS NOT NULL
+            ) AS volume_rows,
+
+            COUNT(*)
+            FILTER (
+                WHERE delivery_percentage IS NOT NULL
+            ) AS delivery_rows,
+
+            COUNT(*)
+            FILTER (
+                WHERE is_fo_eligible = 1
+            ) AS fo_rows
+
+        FROM mv_unified_market_matrix
+
+        WHERE ticker = $ticker
     """
-    return engine.execute(query, {"target_date": target_date}).df()
+
+    df = engine.execute(
+        query,
+        {
+            "ticker": ticker,
+        },
+    ).pl()
+
+    if df.is_empty():
+
+        return {
+            "rows_total": 0,
+            "min_date": None,
+            "max_date": None,
+            "close_rows": 0,
+            "volume_rows": 0,
+            "delivery_rows": 0,
+            "fo_rows": 0,
+        }
+
+    return df.to_dicts()[0]
 
 
-def fetch_historical_accuracy(ticker: str) -> dict:
-    """Queries Phase 3 validation ledger to extract aggregate realized accuracy metrics."""
+def fetch_market_history(
+    ticker: str,
+    target_date: str,
+    days: int = 60,
+):
+
     query = """
-        SELECT is_directional_hit, variance_error
-        FROM validation_ledger
-        WHERE ticker = $ticker AND engine_name = '1_OLS_Microstructure'
-    """
-    df = engine.execute(query, {"ticker": ticker}).df()
-
-    if df.empty:
-        return {"hit_rate": "N/A", "avg_error": "N/A", "total_audits": 0}
-
-    hits = df["is_directional_hit"].sum()
-    total = len(df)
-    avg_error = df["variance_error"].mean()
-
-    return {
-        "hit_rate": f"{round((hits / total) * 100, 1)}%",
-        "avg_error": f"{round(avg_error * 100, 2)}%",
-        "total_audits": total,
-    }
-
-
-def fetch_trend_matrix(
-    ticker: str, target_date: str, days_lookback: int = 30
-) -> pd.DataFrame:
-    """Fetches and aligns price, volume, and delivery streams into an unjumbled time-series."""
-    query = """
-        SELECT date, close, volume, delivery_percentage
-        FROM unified_market_matrix
-        WHERE ticker = $ticker AND date <= CAST($target_date AS DATE)
+        SELECT
+            date,
+            close,
+            volume,
+            delivery_percentage,
+            oi_pcr,
+            futures_basis,
+            net_block_volume,
+            avg_block_premium,
+            short_percentage
+        FROM mv_unified_market_matrix
+        WHERE ticker = $ticker
+          AND date <= CAST($target_date AS DATE)
         ORDER BY date DESC
         LIMIT $limit
     """
+
     df = engine.execute(
         query,
         {
             "ticker": ticker,
             "target_date": target_date,
-            "limit": days_lookback,
+            "limit": days,
         },
-    ).df()
-    if not df.empty:
-        df = df.sort_values(by="date")
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-        df.set_index("date", inplace=True)
-    return df
+    ).pl()
+
+    if df.is_empty():
+        return pd.DataFrame()
+
+    return df.sort("date").to_pandas().set_index("date")
 
 
-def render_prediction_trajectory_chart(
-    ticker: str, prediction_date: str, horizon_label: str, expected_return: float
+def fetch_prediction_ledger(
+    ticker: str,
+    target_date: str,
 ):
-    """
-    Fetches actual price action following a prediction date and overlays
-    the model's predicted trajectory line for visual hit/miss validation.
-    """
-    horizon_days_map = {"2D": 2, "5D": 5, "20D": 20}
-    target_days = horizon_days_map.get(horizon_label, 5)
 
-    # Fetch the actual price path from the prediction date forward + a few buffer days to see the result
     query = """
-        SELECT date, close
-        FROM unified_market_matrix
-        WHERE ticker = $ticker AND date >= CAST($start_date AS DATE)
-        ORDER BY date ASC
-        LIMIT $limit
+        SELECT
+            asof_date,
+            horizon,
+            signal,
+            score,
+            confidence,
+            veto_flag,
+            penalty,
+            target_metric,
+            reason_json,
+            feature_json,
+            data_quality_score
+        FROM prediction_ledger
+        WHERE ticker = $ticker
+          AND asof_date = CAST($target_date AS DATE)
+          AND engine_name = $engine_name
+        ORDER BY
+            CASE
+                WHEN horizon = '2D' THEN 1
+                WHEN horizon = '5D' THEN 2
+                ELSE 3
+            END
     """
-    actual_df = engine.execute(
-        query,
-        {
-            "ticker": ticker,
-            "start_date": prediction_date,
-            "limit": target_days + 3,
-        },
-    ).df()
 
-    if actual_df.empty or len(actual_df) < 2:
-        st.caption(f"Waiting for market data to validate {prediction_date} signal...")
-        return
+    try:
 
-    # Extract the starting price (T+0)
-    p0 = actual_df.iloc[0]["close"]
-    target_price = p0 * (1 + expected_return)
+        return (
+            engine.execute(
+                query,
+                {
+                    "ticker": ticker,
+                    "target_date": target_date,
+                    "engine_name": ENGINE_NAME,
+                },
+            )
+            .pl()
+            .to_pandas()
+        )
 
-    # Format dates and create the visualization dataframe
-    actual_df["date"] = pd.to_datetime(actual_df["date"]).dt.strftime("%Y-%m-%d")
-    actual_df.set_index("date", inplace=True)
-    actual_df.rename(columns={"close": "Actual Price Path"}, inplace=True)
+    except Exception:
+        return pd.DataFrame()
 
-    # Create the Predicted Trajectory Line (Straight line from P0 to Target Price)
-    # We map this across the exact length of the horizon
-    predicted_path = [None] * len(actual_df)
-    predicted_path[0] = p0  # Start at the exact same point
 
-    # Map the target price to the exact day the horizon matures
-    target_index = min(target_days, len(actual_df) - 1)
-    predicted_path[target_index] = target_price
+def render_prediction_card(
+    record: pd.Series,
+):
 
-    actual_df["Model Predicted Path"] = predicted_path
+    reason = _parse_json(record.get("reason_json"))
 
-    # Interpolate the line visually so it draws a clean slope
-    actual_df["Model Predicted Path"] = actual_df["Model Predicted Path"].interpolate()
-
-    st.markdown("###### 🎯 Expected vs. Actual Validation Tracker")
-    st.line_chart(
-        actual_df[["Actual Price Path", "Model Predicted Path"]],
-        color=["#FFFFFF", "#FF4B4B"],
+    model_fit = reason.get(
+        "model_fit",
+        {},
     )
 
-
-def render_ols_engine_ui(selected_ticker: str):
-    st.markdown(f"### 📊 Engine Terminal Interface")
-
-    # 1. Scope Initialization
-    t_date = st.sidebar.date_input(
-        "Analysis Target Date", datetime.strptime("2026-05-22", "%Y-%m-%d")
+    walk_forward = reason.get(
+        "walk_forward",
+        {},
     )
-    target_date = str(t_date)
 
-    # 2. Fetch Data
-    ticker_df = fetch_single_ticker_ledger(selected_ticker, target_date)
+    target_metric = _parse_json(record.get("target_metric"))
 
-    # 3. Macro Ribbon
-    with st.container():
-        if not ticker_df.empty:
-            # Type-safe parsing for JSON columns
-            raw_reason = ticker_df.iloc[0]["reason_json"]
-            reasoning = (
-                json.loads(raw_reason) if isinstance(raw_reason, str) else raw_reason
+    expected_return = target_metric.get(
+        "expected_return",
+        0.0,
+    )
+
+    direction = record.get(
+        "signal",
+        "NEUTRAL",
+    )
+
+    score = record.get(
+        "score",
+        0.0,
+    )
+
+    confidence = record.get("confidence")
+
+    quality = record.get(
+        "data_quality_score",
+        0.0,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Direction",
+        direction,
+    )
+
+    c2.metric(
+        "Expected Return",
+        (
+            f"{float(expected_return) * 100:.2f}%"
+            if expected_return is not None
+            else "N/A"
+        ),
+    )
+
+    c3.metric(
+        "Direction Score",
+        f"{float(score):.3f}",
+    )
+
+    c4.metric(
+        "Walk-Forward Accuracy",
+        (f"{float(confidence) * 100:.1f}%" if confidence is not None else "N/A"),
+    )
+
+    r1, r2, r3, r4 = st.columns(4)
+
+    r1.metric(
+        "Training Rows",
+        str(
+            model_fit.get(
+                "training_rows",
+                "N/A",
+            )
+        ),
+    )
+
+    r2.metric(
+        "R-Squared",
+        (
+            f"{float(model_fit.get('r_squared', 0.0)):.4f}"
+            if model_fit.get("r_squared") is not None
+            else "N/A"
+        ),
+    )
+
+    r3.metric(
+        "MAE",
+        (
+            f"{float(walk_forward.get('mae', 0.0)) * 100:.3f}%"
+            if walk_forward.get("mae") is not None
+            else "N/A"
+        ),
+    )
+
+    r4.metric(
+        "Data Quality",
+        f"{float(quality) * 100:.1f}%",
+    )
+
+    st.caption(
+        "R-Squared describes model fit. "
+        "Walk-forward accuracy is used as the historical directional reliability measure."
+    )
+
+    with st.expander(
+        "Current Feature Snapshot",
+        expanded=False,
+    ):
+
+        features = _parse_json(record.get("feature_json"))
+
+        feature_rows = [
+            {
+                "Feature": key,
+                "Value": value,
+            }
+            for key, value in features.items()
+        ]
+
+        st.dataframe(
+            pd.DataFrame(feature_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with st.expander(
+        "Model Diagnostics",
+        expanded=False,
+    ):
+
+        st.json(reason)
+
+
+def render_ols_engine_ui(
+    selected_ticker: str,
+):
+
+    st.markdown("## Engine 1: Market Microstructure")
+
+    st.caption(
+        "Engine 1 consumes only mv_unified_market_matrix. "
+        "Macro, institutional, fundamentals and news are not used here."
+    )
+
+    latest_market_date = fetch_latest_market_date(selected_ticker)
+
+    if latest_market_date:
+
+        default_date = datetime.strptime(
+            latest_market_date,
+            "%Y-%m-%d",
+        ).date()
+
+    else:
+
+        default_date = datetime.now().date()
+
+    target_date = st.date_input(
+        "Analysis Date",
+        value=default_date,
+        key="engine1_analysis_date",
+        help=("For the first run, leave this at the latest available market date."),
+    )
+
+    target_date_str = target_date.strftime("%Y-%m-%d")
+
+    readiness = fetch_data_readiness(selected_ticker)
+
+    st.markdown("### Data Readiness")
+
+    q1, q2, q3, q4 = st.columns(4)
+
+    q1.metric(
+        "Rows",
+        str(
+            readiness.get(
+                "rows_total",
+                0,
+            )
+        ),
+    )
+
+    q2.metric(
+        "History From",
+        str(
+            readiness.get(
+                "min_date",
+                "N/A",
+            )
+        ),
+    )
+
+    q3.metric(
+        "History To",
+        str(
+            readiness.get(
+                "max_date",
+                "N/A",
+            )
+        ),
+    )
+
+    q4.metric(
+        "F&O Rows",
+        str(
+            readiness.get(
+                "fo_rows",
+                0,
+            )
+        ),
+    )
+
+    run_col, note_col = st.columns([1, 4])
+
+    with run_col:
+
+        run_engine = st.button(
+            "Run Engine 1",
+            type="primary",
+            key="run_engine1_button",
+        )
+
+    with note_col:
+
+        st.caption(
+            "Runs the model from the dashboard. No terminal command is required."
+        )
+
+    if run_engine:
+
+        runner = OLSMicrostructureEngine()
+
+        with st.spinner(f"Running Engine 1 for {selected_ticker}..."):
+
+            try:
+
+                result = runner.execute_pipeline(
+                    ticker=selected_ticker,
+                    asof_date=target_date_str,
+                    lookback=750,
+                    run_diagnostics=True,
+                )
+
+                st.session_state["engine1_last_result"] = result
+
+            except Exception as exc:
+
+                st.session_state["engine1_last_result"] = {
+                    "status": "ERROR",
+                    "ticker": selected_ticker,
+                    "error": str(exc),
+                    "predictions": [],
+                }
+
+    result = st.session_state.get("engine1_last_result")
+
+    if result and result.get("ticker") == selected_ticker:
+
+        status = result.get(
+            "status",
+            "UNKNOWN",
+        )
+
+        if status == "SUCCESS":
+
+            st.success(f"Engine 1 completed for {selected_ticker}.")
+
+            effective_date = result.get("effective_market_date")
+
+            if effective_date:
+
+                st.info(
+                    f"Requested date: {target_date_str} | "
+                    f"Effective market row: {effective_date}"
+                )
+
+        elif status == "ERROR":
+
+            st.error(
+                "Engine 1 failed: "
+                + result.get(
+                    "error",
+                    "Unknown error",
+                )
             )
 
-            regime = reasoning.get("systemic_regime_context", "Neutral")
-            color = (
-                "green"
-                if regime == "Risk-On"
-                else "red" if regime == "Risk-Off" else "gray"
-            )
-            st.markdown(
-                f"**Market Regime:** :{color}[{regime}] | **Ticker:** {selected_ticker}"
-            )
+        else:
 
-    # 4. Forensic Visualizer
-    trend_df = fetch_trend_matrix(selected_ticker, target_date)
-    if not trend_df.empty:
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.markdown("#### Price & Institutional Accumulation")
-            st.line_chart(trend_df[["close"]], height=300, use_container_width=True)
-        with c2:
-            st.markdown("#### Delivery Flow")
-            st.bar_chart(
-                trend_df["delivery_percentage"], height=300, use_container_width=True
-            )
+            st.warning(f"Engine 1 status: {status}")
 
-    # 5. Decision Matrix
-    st.markdown("---")
-    st.markdown("#### Decision Matrix & Audit Validation")
+    prediction_df = fetch_prediction_ledger(
+        selected_ticker,
+        target_date_str,
+    )
 
-    tabs = st.tabs(["2-Day Signal", "5-Day Signal", "20-Day Signal"])
+    if prediction_df.empty:
 
-    for tab, h_label in zip(tabs, ["2D", "5D", "20D"]):
-        with tab:
-            row = (
-                ticker_df[ticker_df["horizon"] == h_label].iloc[0]
-                if not ticker_df[ticker_df["horizon"] == h_label].empty
-                else None
-            )
+        st.info("No Engine 1 prediction is stored for this ticker/date yet.")
 
-            if row is None:
-                st.info("No data for this horizon.")
+    else:
+
+        st.markdown("### Engine 1 Prediction Output")
+
+        for horizon in [
+            "2D",
+            "5D",
+        ]:
+
+            horizon_df = prediction_df[prediction_df["horizon"] == horizon]
+
+            if horizon_df.empty:
                 continue
 
-            # Robust Type Handling for features/reasoning
-            raw_features = row["feature_json"]
-            features = (
-                json.loads(raw_features)
-                if isinstance(raw_features, str)
-                else raw_features
+            st.markdown(f"#### {horizon} Horizon")
+
+            render_prediction_card(horizon_df.iloc[0])
+
+    st.divider()
+
+    history_df = fetch_market_history(
+        selected_ticker,
+        target_date_str,
+        days=60,
+    )
+
+    if not history_df.empty:
+
+        st.markdown("### Recent Market Microstructure")
+
+        left, right = st.columns([3, 1])
+
+        with left:
+
+            st.line_chart(
+                history_df[["close"]],
+                height=320,
             )
 
-            raw_reason = row["reason_json"]
-            reasoning = (
-                json.loads(raw_reason) if isinstance(raw_reason, str) else raw_reason
+        with right:
+
+            st.bar_chart(
+                history_df[["volume"]],
+                height=320,
             )
 
-            audit_stats = fetch_historical_accuracy(selected_ticker)
+        with st.expander(
+            "Raw Market Matrix",
+            expanded=False,
+        ):
 
-            # KPI Grid
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Signal", row["signal"])
-            k2.metric("Target Return", f"{round(row['score']*100, 2)}%")
-            k3.metric("Conviction", f"{round(row['confidence']*100, 1)}%")
-            k4.metric("Audited Hit Rate", audit_stats["hit_rate"])
-
-            # Validation Callout
-            if audit_stats["total_audits"] > 0:
-                st.caption(
-                    f"Audit: Based on {audit_stats['total_audits']} predictions. "
-                    f"Drift: {audit_stats['avg_error']}. "
-                    f"Status: {'Model Unbiased' if abs(float(audit_stats['avg_error'].replace('%',''))) < 1 else 'Systemic Bias'}"
-                )
-
-            # Forensic Metrics
-            col1, col2 = st.columns(2)
-            with col1:
-                st.info(
-                    f"**Structural Footprints**\n\n"
-                    f"• Delivery: {round(features.get('delivery_percentage', 0), 2)}%\n"
-                    f"• PCR Change: {round(features.get('pcr_change', 0), 4)}\n"
-                    f"• Futures Basis: {round(features.get('futures_basis', 0), 4)}"
-                )
-            with col2:
-                st.warning(
-                    f"**Internal Engine State**\n\n"
-                    f"• Volume Consistency: `{features.get('intraday_volume_consistency', 0)}`\n"
-                    f"• Macro Context: `{reasoning.get('systemic_regime_context', 'Neutral')}`\n"
-                    f"• R-Squared: `{reasoning.get('model_r_squared', 0)}`"
-                )
+            st.dataframe(
+                history_df.reset_index(),
+                hide_index=True,
+                use_container_width=True,
+            )

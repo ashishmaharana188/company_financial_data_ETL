@@ -59,7 +59,7 @@ def backfill_structural_breaks(target_tickers=None):
         if target_tickers:
             tickers = target_tickers
         else:
-            result = conn.execute(text('SELECT "Ticker" FROM company_profiles;'))
+            result = conn.execute(text('SELECT "Ticker" FROM market_metadata;'))
             tickers = [row[0] for row in result]
 
         for ticker in tickers:
@@ -73,11 +73,13 @@ def backfill_structural_breaks(target_tickers=None):
                     f"  -> WARNING: Break detected on {break_date}. Updating database."
                 )
                 # 3. Save the date to the database
-                update_query = text("""
-                    UPDATE company_profiles 
+                update_query = text(
+                    """
+                    UPDATE market_metadata
                     SET valid_data_since = :break_date 
                     WHERE "Ticker" = :ticker
-                """)
+                """
+                )
                 conn.execute(update_query, {"break_date": break_date, "ticker": ticker})
             else:
                 print(f"  -> Clean history. No action required.")
