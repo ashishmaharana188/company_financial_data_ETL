@@ -1,15 +1,14 @@
 import streamlit as st
 import pandas as pd
-import polars as pl
-from scripts.database import DB_PATH
+from scripts.database import engine
 from scripts.statementScrape import run_etl_pipeline
 from scripts.macroScrape import register_discovered_tickers
 import subprocess
 import sys
 from datetime import datetime, timedelta
 import duckdb
+from scripts.engines.companyMetrics import render_company_metrics
 from scripts.engines.olsEngine1 import OLSMicrostructureEngine
-import json
 
 # Import fetchers for the Market Overview (since it still calculates cross-sectional data)
 from scripts.ratioAnalysis import fetch_roic, fetch_fcf_yield
@@ -269,74 +268,7 @@ elif app_mode == "Company Data":
             ]
             mode_param = "local" if "Local" in selected_mode else "cloud"
             backend_source = spigot_map[selected_spigot]
-    st.subheader("Execute ETL Batch")
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        ticker_input = st.text_input(
-            "Target Tickers (comma-separated)",
-            placeholder="e.g., RELIANCE.NS, TATAPOWER.NS",
-            key="etl_ticker_input_widget",
-        )
-    with col2:
-        selected_mode = st.radio(
-            "AI Routing Engine:",
-            ["Local (Ollama)", "Cloud (Gemini)"],
-            horizontal=True,
-            key="etl_ai_mode_radio",
-        )
 
-    st.caption("Data Spigot Configuration")
-    selected_spigot = st.radio(
-        "Select Primary Data Source (Auto-Rotate highly recommended to bypass API limits):",
-        [
-            "Auto-Rotate (FMP -> Alpha Vantage)",
-            "Financial Modeling Prep (FMP)",
-            "Alpha Vantage (Strictly US)",
-            "IndianAPI (Strictly India)",
-            "Yahoo Finance",
-            "Screener.in",
-        ],
-        horizontal=True,
-        key="etl_spigot_radio",
-    )
-
-    spigot_map = {
-        "Auto-Rotate (FMP -> Alpha Vantage)": "auto",
-        "Financial Modeling Prep (FMP)": "fmp",
-        "Alpha Vantage (Strictly US)": "vantage",
-        "IndianAPI (Strictly India)": "indianapi",
-        "Yahoo Finance": "yfinance",
-        "Screener.in": "screener",
-    }
-
-    if "pipeline_results" not in st.session_state:
-        st.session_state.pipeline_results = None
-
-    if st.button(
-        "Start ETL Pipeline",
-        type="primary",
-        use_container_width=False,
-        key="etl_start_button",
-    ):
-        if not ticker_input.strip():
-            st.warning("Please enter at least one ticker to proceed.")
-        else:
-            target_tickers = [
-                t.strip().upper() for t in ticker_input.split(",") if t.strip()
-            ]
-            mode_param = "local" if "Local" in selected_mode else "cloud"
-            backend_source = spigot_map[selected_spigot]
-
-            with st.spinner(
-                f"Executing pipeline via {selected_spigot} for {len(target_tickers)} client(s)..."
-            ):
-                try:
-                    register_discovered_tickers(target_tickers)
-                    st.session_state.pipeline_results = run_etl_pipeline(
-                        target_tickers=target_tickers,
-                        ai_mode=mode_param,
-                        requested_source=backend_source,
-                    )
             with st.spinner(
                 f"Executing pipeline via {selected_spigot} for {len(target_tickers)} client(s)..."
             ):
@@ -350,17 +282,7 @@ elif app_mode == "Company Data":
                     st.success("ETL Batch Processing Complete!")
                 except Exception as e:
                     st.error(f"Pipeline crashed during execution: {e}")
-                except Exception as e:
-                    st.error(f"Pipeline crashed during execution: {e}")
 
-    if st.session_state.pipeline_results:
-        batch_results = st.session_state.pipeline_results
-        summary_df = pd.DataFrame(
-            [
-                {k: v for k, v in res.items() if k != "DataPayload"}
-                for res in batch_results
-            ]
-        )
     if st.session_state.pipeline_results:
         batch_results = st.session_state.pipeline_results
         summary_df = pd.DataFrame(
@@ -386,50 +308,11 @@ elif app_mode == "Company Data":
             hide_index=True,
             use_container_width=True,
         )
-        st.dataframe(
-            summary_df,
-            column_config={
-                "Ticker": st.column_config.TextColumn("Client (Ticker)"),
-                "Status": st.column_config.TextColumn("Fetch Status"),
-                "Direct Validation": st.column_config.TextColumn(
-                    "Direct Audit (BS/IS/CF)"
-                ),
-                "Indirect Validation": st.column_config.TextColumn(
-                    "Indirect Audit (OCF/FCF)"
-                ),
-                "Rows Upserted": st.column_config.NumberColumn("Periods Upserted"),
-            },
-            hide_index=True,
-            use_container_width=True,
-        )
 
         st.divider()
         st.subheader("Deep Dive Data Inspector")
         valid_results = [r for r in batch_results if "DataPayload" in r]
-        st.divider()
-        st.subheader("Deep Dive Data Inspector")
-        valid_results = [r for r in batch_results if "DataPayload" in r]
 
-        if valid_results:
-            inspector_col1, inspector_col2 = st.columns([1, 2])
-            with inspector_col1:
-                selected_ticker = st.selectbox(
-                    "Select Client:",
-                    [r["Ticker"] for r in valid_results],
-                    key="etl_client_inspector_selectbox",
-                )
-            with inspector_col2:
-                selected_statement = st.radio(
-                    "Select Statement:",
-                    [
-                        "Income Statement (IS)",
-                        "Balance Sheet (BS)",
-                        "Cash Flow (CF)",
-                        "Indirect Cash Flow (ICF)",
-                    ],
-                    horizontal=True,
-                    key="etl_statement_radio",
-                )
         if valid_results:
             inspector_col1, inspector_col2 = st.columns([1, 2])
             with inspector_col1:
@@ -469,28 +352,7 @@ elif app_mode == "Company Data":
                 ),
                 None,
             )
-            stmt_key = (
-                "IS"
-                if "Income" in selected_statement
-                else (
-                    "BS"
-                    if "Balance" in selected_statement
-                    else "ICF" if "Indirect" in selected_statement else "CF"
-                )
-            )
 
-            client_data = next(
-                (
-                    item["DataPayload"]
-                    for item in valid_results
-                    if item["Ticker"] == selected_ticker
-                ),
-                None,
-            )
-
-            if client_data:
-                raw_df = client_data[stmt_key]["Raw"]
-                clean_df = client_data[stmt_key]["Clean"]
             if client_data:
                 raw_df = client_data[stmt_key]["Raw"]
                 clean_df = client_data[stmt_key]["Clean"]
@@ -508,41 +370,24 @@ elif app_mode == "Company Data":
 
 elif app_mode == "Engines":
     st.title("Quantitative Engines & Deep Dive")
-    st.caption(
-        "Engine execution is isolated from Company Metrics. Engine 1 reads the Alpha Factory directly with DuckDB + Polars."
-    )
 
-    def read_pl(query, params=None):
-        """Direct OLAP read path. Avoids the legacy proxy .df() path."""
-        with duckdb.connect(DB_PATH, read_only=True) as con:
-            result = con.execute(query, params or {})
-            try:
-                return result.pl()
-            except AttributeError:
-                return pl.from_arrow(result.fetch_arrow_table())
-
+    # The repository uses a native DuckDB proxy, not SQLAlchemy.
     try:
-        ticker_df = read_pl(
-            """
-            SELECT "Ticker", "Sector", "Industry", "Description"
-            FROM market_metadata
-            WHERE "IsActive" = TRUE
-            ORDER BY "Ticker"
-            """
-        )
+        tickers_df = engine.execute(
+            'SELECT "Ticker" FROM market_metadata WHERE "IsActive" = TRUE ORDER BY "Ticker"'
+        ).df()
         available_db_tickers = (
-            ticker_df.get_column("Ticker").drop_nulls().cast(pl.String).to_list()
-            if "Ticker" in ticker_df.columns
+            tickers_df["Ticker"].dropna().astype(str).tolist()
+            if not tickers_df.empty
             else []
         )
     except Exception as e:
-        ticker_df = pl.DataFrame()
         available_db_tickers = []
-        st.error(f"Failed to query active tickers: {e}")
+        st.error(f"Failed to query database: {e}")
 
     if not available_db_tickers:
         st.info(
-            "No active tickers available in market_metadata. Run the ETL pipeline first."
+            "No active tickers available in the database. Please run the ETL pipeline first."
         )
     else:
         selected_db_ticker = st.selectbox(
@@ -551,89 +396,66 @@ elif app_mode == "Engines":
             key="single_db_ticker_selectbox",
         )
 
-        metadata_rows = ticker_df.filter(pl.col("Ticker") == selected_db_ticker)
-        if not metadata_rows.is_empty():
-            meta = metadata_rows.row(0, named=True)
-            company_label = meta.get("Description") or selected_db_ticker
-            sector = meta.get("Sector") or "Unknown"
-            industry = meta.get("Industry") or "Unknown"
-            st.caption(f"{company_label} | Sector: {sector} | Industry: {industry}")
+        edgar_break_date = None
+        company_sector = "DEFAULT"
+        company_industry = "DEFAULT"
+
+        try:
+            profile_df = engine.execute(
+                """
+                SELECT "valid_data_since", "Sector", "Industry"
+                FROM market_metadata
+                WHERE "Ticker" = $ticker
+                LIMIT 1
+                """,
+                {"ticker": selected_db_ticker},
+            ).df()
+
+            if not profile_df.empty:
+                profile_row = profile_df.iloc[0]
+                edgar_break_date = profile_row.get("valid_data_since")
+                company_sector = profile_row.get("Sector") or "DEFAULT"
+                company_industry = profile_row.get("Industry") or "DEFAULT"
+        except Exception:
+            pass
+
+        st.markdown("### Swarm Memory Controls")
+        view_mode = st.radio(
+            "Select Historical Perspective:",
+            [
+                "Swarm Predictive (Strictly Post-Edgar)",
+                "Historical Audit (Merged Before & After)",
+            ],
+            horizontal=True,
+        )
+
+        render_company_metrics(
+            selected_db_ticker,
+            selected_source,
+            view_mode,
+            edgar_break_date,
+            engine,
+        )
 
         st.divider()
         st.markdown("### Engine 1: Market Microstructure")
-        st.caption(
-            "No macro, FII/DII, fundamental, commodity, valuation, penalty, or veto logic is applied inside Engine 1."
+
+        latest_market_date = engine.scalar(
+            f"""SELECT MAX(date) FROM mv_unified_market_matrix
+                WHERE ticker = '{selected_db_ticker.replace("'", "''")}' """
         )
 
-        try:
-            readiness = read_pl(
-                """
-                SELECT
-                    COUNT(*) AS row_count,
-                    MIN(date) AS min_date,
-                    MAX(date) AS max_date
-                FROM mv_unified_market_matrix
-                WHERE ticker = $ticker
-                """,
-                {"ticker": selected_db_ticker},
-            )
+        if latest_market_date is None:
+            st.warning(f"No market-matrix data is available for {selected_db_ticker}.")
+        else:
+            latest_market_date = pd.to_datetime(latest_market_date).date()
 
-            if readiness.is_empty():
-                row_count = 0
-                min_date = None
-                max_date = None
-            else:
-                ready_row = readiness.row(0, named=True)
-                row_count = int(ready_row.get("row_count") or 0)
-                min_date = ready_row.get("min_date")
-                max_date = ready_row.get("max_date")
-
-            try:
-                prediction_ledger_check = read_pl(
-                    """
-                    SELECT COUNT(*) AS prediction_rows
-                    FROM prediction_ledger
-                    WHERE engine_name = '1_OLS_Microstructure'
-                      AND ticker = $ticker
-                    """,
-                    {"ticker": selected_db_ticker},
-                )
-                existing_predictions = (
-                    int(
-                        prediction_ledger_check.row(0, named=True).get(
-                            "prediction_rows"
-                        )
-                        or 0
-                    )
-                    if not prediction_ledger_check.is_empty()
-                    else 0
-                )
-            except Exception:
-                # Engine 1 creates prediction_ledger itself on first write.
-                existing_predictions = 0
-
-            r1, r2, r3 = st.columns(3)
-            r1.metric("Alpha Factory Rows", f"{row_count:,}")
-            r2.metric("Available Date Range", f"{min_date} → {max_date}")
-            r3.metric("Stored Engine 1 Snapshots", f"{existing_predictions:,}")
-
-            if row_count < OLSMicrostructureEngine.MIN_TRAIN_ROWS + 20:
-                st.warning(
-                    f"Engine 1 needs sufficient history for rolling features and OLS. Only {row_count} matrix rows are available for {selected_db_ticker}."
-                )
-        except Exception as e:
-            row_count = 0
-            max_date = None
-            st.error(f"Failed to inspect Engine 1 data readiness: {e}")
-
-        if max_date is not None:
-            engine_latest_date = pd.to_datetime(max_date).date()
             col_date, col_run = st.columns([1, 1])
             with col_date:
                 engine_target_date = st.date_input(
                     "Engine 1 Analysis Date",
-                    value=engine_latest_date,
-                    max_value=engine_latest_date,
+                    value=latest_market_date,
+                    max_value=latest_market_date,
                     key="engine1_target_date",
                 )
             with col_run:
@@ -661,19 +483,17 @@ elif app_mode == "Engines":
 
                         if result.get("status") == "SUCCESS":
                             st.success(
-                                f"Engine 1 executed successfully. {len(result.get('records', []))} horizon prediction(s) written to prediction_ledger."
+                                f"Engine 1 refreshed successfully for {result['asof_date']}."
                             )
                         else:
                             st.warning(
                                 f"Engine 1 completed with status: {result.get('status')}"
                             )
-                            if result.get("diagnostics"):
-                                st.json(result["diagnostics"])
                     except Exception as e:
-                        st.error(f"Engine 1 execution failed: {type(e).__name__}: {e}")
+                        st.error(f"Engine 1 failed: {e}")
 
             try:
-                prediction_df = read_pl(
+                prediction_df = engine.execute(
                     """
                     SELECT
                         horizon,
@@ -685,10 +505,9 @@ elif app_mode == "Engines":
                         target_metric,
                         reason_json,
                         feature_json,
-                        data_quality_score,
-                        asof_date
+                        data_quality_score
                     FROM prediction_ledger
-                    WHERE engine_name = '1_OLS_Microstructure'
+                    WHERE engine_name = '1_Market_Microstructure'
                       AND ticker = $ticker
                       AND asof_date = CAST($asof_date AS DATE)
                     ORDER BY CASE
@@ -701,56 +520,57 @@ elif app_mode == "Engines":
                         "ticker": selected_db_ticker,
                         "asof_date": str(engine_target_date),
                     },
-                )
+                ).df()
             except Exception as e:
-                prediction_df = pl.DataFrame()
+                prediction_df = pd.DataFrame()
                 st.error(f"Failed to read Engine 1 predictions: {e}")
 
-            if prediction_df.is_empty():
+            if prediction_df.empty:
                 st.info(
-                    "No Engine 1 prediction snapshot exists for this date. Run / Refresh Engine 1 above."
+                    "No Engine 1 prediction snapshot exists for this date. "
+                    "Run / Refresh Engine 1 above."
                 )
             else:
                 st.subheader("Engine 1 Prediction Snapshot")
 
-                metric_cols = st.columns(prediction_df.height)
-                for idx, pred in enumerate(prediction_df.iter_rows(named=True)):
+                metric_cols = st.columns(len(prediction_df))
+                for idx, (_, pred) in enumerate(prediction_df.iterrows()):
                     with metric_cols[idx]:
-                        st.metric(f"{pred['horizon']} Direction", str(pred["signal"]))
-                        if pred.get("score") is not None:
+                        st.metric(
+                            f"{pred['horizon']} Direction",
+                            str(pred["signal"]),
+                        )
+                        if pd.notna(pred["score"]):
                             st.caption(f"Direction score: {float(pred['score']):.3f}")
-                        if pred.get("confidence") is not None:
+                        if pd.notna(pred["confidence"]):
                             st.caption(
                                 f"Walk-forward accuracy: {float(pred['confidence']) * 100:.1f}%"
                             )
-                        if pred.get("data_quality_score") is not None:
+                        if pd.notna(pred["data_quality_score"]):
                             st.caption(
                                 f"Data quality: {float(pred['data_quality_score']) * 100:.1f}%"
                             )
 
-                horizons = prediction_df.get_column("horizon").to_list()
                 selected_horizon = st.selectbox(
                     "Prediction Detail",
-                    horizons,
+                    prediction_df["horizon"].tolist(),
                     key="engine1_horizon_detail",
                 )
-                selected_pred = prediction_df.filter(
-                    pl.col("horizon") == selected_horizon
-                ).row(0, named=True)
+                selected_pred = prediction_df[
+                    prediction_df["horizon"] == selected_horizon
+                ].iloc[0]
 
                 try:
-                    target_payload = selected_pred.get("target_metric")
+                    target_payload = selected_pred["target_metric"]
                     if isinstance(target_payload, str):
                         target_payload = json.loads(target_payload)
-                    target_payload = target_payload or {}
                 except Exception:
                     target_payload = {}
 
                 try:
-                    reason_payload = selected_pred.get("reason_json")
+                    reason_payload = selected_pred["reason_json"]
                     if isinstance(reason_payload, str):
                         reason_payload = json.loads(reason_payload)
-                    reason_payload = reason_payload or {}
                 except Exception:
                     reason_payload = {}
 
@@ -769,7 +589,8 @@ elif app_mode == "Engines":
                         )
                     if lower is not None and upper is not None:
                         st.caption(
-                            f"Approx. model interval: {float(lower) * 100:.2f}% to {float(upper) * 100:.2f}%"
+                            f"Approx. 95% model interval: "
+                            f"{float(lower) * 100:.2f}% to {float(upper) * 100:.2f}%"
                         )
 
                 with detail_right:
@@ -781,7 +602,6 @@ elif app_mode == "Engines":
                             "r_squared": model_fit.get("r_squared"),
                             "adjusted_r_squared": model_fit.get("adjusted_r_squared"),
                             "training_rows": model_fit.get("training_rows"),
-                            "condition_number": model_fit.get("condition_number"),
                             "walk_forward_samples": walk_forward.get("sample_size"),
                             "directional_accuracy": walk_forward.get(
                                 "directional_accuracy"
@@ -791,65 +611,53 @@ elif app_mode == "Engines":
                         }
                     )
 
-                st.markdown("#### Current Microstructure Snapshot")
-                feature_payload = selected_pred.get("feature_json")
+                st.markdown("#### Current Feature Snapshot")
                 try:
+                    feature_payload = selected_pred["feature_json"]
                     if isinstance(feature_payload, str):
                         feature_payload = json.loads(feature_payload)
-                    feature_payload = feature_payload or {}
                 except Exception:
                     feature_payload = {}
 
                 if feature_payload:
-                    feature_rows = [
-                        {"feature": key, "value": value}
-                        for key, value in feature_payload.items()
-                    ]
+                    feature_df = pd.DataFrame(
+                        [
+                            {"feature": key, "value": value}
+                            for key, value in feature_payload.items()
+                        ]
+                    )
                     st.dataframe(
-                        pl.DataFrame(feature_rows),
+                        feature_df,
                         hide_index=True,
                         use_container_width=True,
                     )
-        else:
-            st.warning(
-                f"No rows found in mv_unified_market_matrix for {selected_db_ticker}."
-            )
 
         if engine_view == "Canvas Mode (All Engines)":
             st.divider()
             st.markdown("### Canvas Mode")
             st.info(
-                "Engine 1 is active and isolated. Additional engines will be attached only after Engine 1 validation."
+                "Engine 1 is currently active. Additional engines will be attached "
+                "to this canvas after Engine 1 validation."
             )
-
 
 elif app_mode == "Market Overview":
     st.title("Market Overview")
     st.markdown("Cross-sectional ranking and quadrant analysis.")
 
-    def read_market_pl(query, params=None):
-        with duckdb.connect(DB_PATH, read_only=True) as con:
-            result = con.execute(query, params or {})
-            try:
-                return result.pl()
-            except AttributeError:
-                return pl.from_arrow(result.fetch_arrow_table())
-
     try:
-        sectors_df = read_market_pl(
+        sectors_df = engine.execute(
             """
             SELECT DISTINCT "Sector"
             FROM market_metadata
             WHERE "Sector" IS NOT NULL
-              AND "Sector" <> ''
+            AND "Sector" <> ''
             ORDER BY "Sector"
             """
-        )
+        ).df()
+
         available_sectors = ["All Market"]
-        if not sectors_df.is_empty():
-            available_sectors.extend(
-                sectors_df.get_column("Sector").drop_nulls().cast(pl.String).to_list()
-            )
+        if not sectors_df.empty:
+            available_sectors.extend(sectors_df["Sector"].dropna().astype(str).tolist())
     except Exception as e:
         available_sectors = ["All Market"]
         st.error(f"Failed to load sectors: {e}")
@@ -860,43 +668,39 @@ elif app_mode == "Market Overview":
         with st.spinner("Aggregating live cross-sectional data..."):
             try:
                 if selected_sector == "All Market":
-                    target_companies = read_market_pl(
+                    target_companies = engine.execute(
                         """
-                        SELECT
-                            "Ticker",
-                            COALESCE(NULLIF("Description", ''), "Ticker") AS "Company"
-                        FROM market_metadata
+                        SELECT "Ticker", "CompanyName"
+                        FROM company_profiles
                         WHERE "Ticker" IS NOT NULL
                         ORDER BY "Ticker"
                         """
-                    )
+                    ).df()
                 else:
-                    target_companies = read_market_pl(
+                    target_companies = engine.execute(
                         """
-                        SELECT
-                            "Ticker",
-                            COALESCE(NULLIF("Description", ''), "Ticker") AS "Company"
-                        FROM market_metadata
+                        SELECT "Ticker", "CompanyName"
+                        FROM company_profiles
                         WHERE "Sector" = $sector
                           AND "Ticker" IS NOT NULL
                         ORDER BY "Ticker"
                         """,
                         {"sector": selected_sector},
-                    )
+                    ).df()
             except Exception as e:
-                st.error(f"Failed to query market metadata: {e}")
-                target_companies = pl.DataFrame()
+                st.error(f"Failed to query sectors: {e}")
+                target_companies = pd.DataFrame()
 
-            if target_companies.is_empty():
+            if target_companies.empty:
                 st.warning(
                     "No companies found in this sector. Run the ETL pipeline on more tickers."
                 )
             else:
                 market_data = []
 
-                for row in target_companies.iter_rows(named=True):
+                for _, row in target_companies.iterrows():
                     t = row["Ticker"]
-                    c_name = row.get("Company") or t
+                    c_name = row["CompanyName"]
 
                     try:
                         df_roic_tmp = fetch_roic(t, selected_source)
