@@ -21,3 +21,4 @@ offline_data_cache
 offline_statements
 /offline_statements
 parquet
+*min.js
