@@ -1,24 +1,30 @@
-
+# Environment and secrets
 .env
-ingestion_audit.log
-.venv/
-ingestion_audit.log
+.env.*
+!.env.example
+
+# Python environments and bytecode
 .venv/
 env/
-pipeline_execution.log
-pipeline_execution.log
 __pycache__/
 *.py[cod]
 *$py.class
-offline_data_cache
-offline_data_cache
+
+# Logs and caches
+ingestion_audit.log
+pipeline_execution.log
+offline_data_cache/
+.tmp/
 .DS_Store
 Thumbs.db
+
+# Local-only input and database files
 market_data.duckdb
 market_data.duckdb.wal
-offline_data_cache
-.tmp
-offline_statements
-/offline_statements
-parquet
+offline_statements/
+parquet/
+
+# Keep the exact Plotly.js bundle required by app/components/charts.py
+# (The app uses include_plotlyjs=False and loads this local asset.)
 *min.js
+!app/assets/plotly.min.js

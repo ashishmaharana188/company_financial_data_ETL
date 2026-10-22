@@ -146,12 +146,21 @@ if app_mode == "Data Center":
         col1, col2 = st.columns(2)
         with col1:
             # Default to 2015 genesis
+            # Isolated Bulk Scraper
             scrape_start = st.date_input(
-                "Start Date", value=pd.to_datetime("2015-01-01"), key="scrape_start"
+                "Start Date",
+                value=datetime(2015, 1, 1).date(),
+                min_value=datetime(1900, 1, 1).date(),
+                max_value=datetime.now().date(),
+                key="scrape_start",
             )
-        with col2:
+
             scrape_end = st.date_input(
-                "End Date", value=datetime.now(), key="scrape_end"
+                "End Date",
+                value=datetime.now().date(),
+                min_value=datetime(1900, 1, 1).date(),
+                max_value=datetime.now().date(),
+                key="scrape_end",
             )
 
         if st.button("Run Scrapers Only"):

@@ -1,7 +1,11 @@
 source .venv/Scripts/activate
 py -m streamlit run dashboard.py
 
+py -m streamlit run unified_app.py
+
 duckdb -ui
+
+etldata123
 
 python -m scripts.statementScrape
 pip install -r requirements.txt

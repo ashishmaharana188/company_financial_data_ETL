@@ -1,0 +1,1 @@
+Use the top-level apply_readiness_patch.py script to update the integrated local repository. It performs line-pattern replacements without putting previously committed credentials into patch files. Do not restore hard-coded provider keys or connection URIs.
