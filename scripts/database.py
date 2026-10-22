@@ -40,9 +40,9 @@ class DuckDBEngineProxy:
 
         try:
             if params:
-                res = con.execute(query_string, params).arrow()
+                res = con.execute(query_string, params).to_arrow_table()
             else:
-                res = con.execute(query_string).arrow()
+                res = con.execute(query_string).to_arrow_table()
             return DuckDBResultContainer(res)
         finally:
 
