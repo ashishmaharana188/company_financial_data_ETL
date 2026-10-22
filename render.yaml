@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: financial-market-terminal
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/start_web.py
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: APP_ENTRYPOINT
+        value: unified_app.py
+      - key: SUPABASE_DB_URL
+        sync: false
