@@ -1,15 +1,18 @@
-"""Market metadata upserts through the ETL's existing DuckDB engine.
+"""Register market metadata in the active ETL destination.
 
-Metadata deliberately uses the same ``scripts.database.engine`` as statement
-writes. Do not open a second connection or independently resolve a database
-path here: doing so can send metadata and financial statements to different
-DuckDB files.
+Local development: use scripts.database.engine (the existing market_data.duckdb).
+Hosted deployment: when SUPABASE_DB_URL is present, upsert directly into the
+existing Supabase public.market_metadata table. This is necessary because the
+DuckDB engine is local to the process and does not replicate writes to Supabase.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Iterable
 
 import pandas as pd
+import psycopg2
+
 from scripts.database import engine
 
 _METADATA_COLUMNS = (
@@ -24,6 +27,13 @@ _METADATA_COLUMNS = (
     "valid_data_since",
     "Description",
 )
+
+_SELECT_METADATA = '''
+    SELECT "Ticker", "IndicatorName", "TargetTable", "Sector", "Industry",
+           "AssetClass", "Exchange", "IsActive", "valid_data_since", "Description"
+    FROM public.market_metadata
+    WHERE "Ticker" = ANY(%s)
+'''
 
 
 def _optional_text(value: Any) -> str | None:
@@ -46,11 +56,11 @@ def _normalise_record(record: dict[str, Any]) -> dict[str, Any]:
     indicator_name = _optional_text(record.get("IndicatorName"))
     target_table = _optional_text(record.get("TargetTable")) or "global_assets"
     asset_class = _optional_text(record.get("AssetClass")) or "Equity"
-    is_active = record.get("IsActive", True)
-    if isinstance(is_active, str):
-        is_active = is_active.strip().lower() not in {"0", "false", "no", "inactive"}
+    active = record.get("IsActive", True)
+    if isinstance(active, str):
+        active = active.strip().lower() not in {"0", "false", "no", "inactive"}
     else:
-        is_active = bool(is_active)
+        active = bool(active)
 
     return {
         "Ticker": ticker,
@@ -60,17 +70,57 @@ def _normalise_record(record: dict[str, Any]) -> dict[str, Any]:
         "Industry": _optional_text(record.get("Industry")),
         "AssetClass": asset_class,
         "Exchange": _optional_text(record.get("Exchange")),
-        "IsActive": is_active,
+        "IsActive": active,
         "valid_data_since": record.get("valid_data_since"),
         "Description": _optional_text(record.get("Description")),
     }
 
 
-def _metadata_upsert_sql() -> str:
+def _usable(value: Any) -> bool:
+    text = _optional_text(value)
+    return text is not None and text.upper() not in {"UNKNOWN", "N/A", "NONE"}
+
+
+def _check_persisted(records: list[dict[str, Any]], rows: list[tuple[Any, ...]]) -> None:
+    columns = list(_METADATA_COLUMNS)
+    persisted = {str(row[0]): dict(zip(columns, row)) for row in rows}
+    expected_by_ticker = {record["Ticker"]: record for record in records}
+    missing = sorted(set(expected_by_ticker) - set(persisted))
+    if missing:
+        raise RuntimeError(
+            "market_metadata write was not visible after commit for ticker(s): "
+            + ", ".join(missing)
+        )
+
+    for ticker, expected in expected_by_ticker.items():
+        actual = persisted[ticker]
+        for field in ("TargetTable", "AssetClass", "IsActive"):
+            if actual.get(field) != expected.get(field):
+                raise RuntimeError(
+                    f'market_metadata verification failed for {ticker}: {field} '
+                    f'expected {expected.get(field)!r}, got {actual.get(field)!r}'
+                )
+        for field in ("Sector", "Industry", "Exchange", "Description"):
+            if _usable(expected.get(field)) and actual.get(field) != expected.get(field):
+                raise RuntimeError(
+                    f'market_metadata verification failed for {ticker}: {field} '
+                    f'expected {expected.get(field)!r}, got {actual.get(field)!r}'
+                )
+        indicator = _optional_text(expected.get("IndicatorName"))
+        if indicator and indicator != ticker and actual.get("IndicatorName") != indicator:
+            raise RuntimeError(
+                f'market_metadata verification failed for {ticker}: IndicatorName '
+                f'expected {indicator!r}, got {actual.get("IndicatorName")!r}'
+            )
+        if expected.get("valid_data_since") is not None and actual.get("valid_data_since") != expected.get("valid_data_since"):
+            raise RuntimeError(
+                f"market_metadata verification failed for {ticker}: valid_data_since was not persisted"
+            )
+
+
+def _duckdb_upsert(records: list[dict[str, Any]]) -> int:
     columns = ", ".join(f'"{column}"' for column in _METADATA_COLUMNS)
-    # Preserve previously useful profile fields when discovery/profile APIs
-    # return nulls or placeholders. Refresh activity and non-empty core fields.
-    return f'''
+    query = f'''
         INSERT INTO market_metadata ({columns})
         SELECT {columns} FROM temp_market_metadata_upsert
         ON CONFLICT ("Ticker") DO UPDATE SET
@@ -84,145 +134,171 @@ def _metadata_upsert_sql() -> str:
             END,
             "TargetTable" = COALESCE(NULLIF(EXCLUDED."TargetTable", ''), "TargetTable"),
             "Sector" = CASE
-                WHEN EXCLUDED."Sector" IS NULL
-                    OR UPPER(TRIM(EXCLUDED."Sector")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
-                    THEN "Sector"
-                ELSE EXCLUDED."Sector"
-            END,
+                WHEN EXCLUDED."Sector" IS NULL OR UPPER(TRIM(EXCLUDED."Sector")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
+                    THEN "Sector" ELSE EXCLUDED."Sector" END,
             "Industry" = CASE
-                WHEN EXCLUDED."Industry" IS NULL
-                    OR UPPER(TRIM(EXCLUDED."Industry")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
-                    THEN "Industry"
-                ELSE EXCLUDED."Industry"
-            END,
+                WHEN EXCLUDED."Industry" IS NULL OR UPPER(TRIM(EXCLUDED."Industry")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
+                    THEN "Industry" ELSE EXCLUDED."Industry" END,
             "AssetClass" = COALESCE(NULLIF(EXCLUDED."AssetClass", ''), "AssetClass"),
             "Exchange" = CASE
-                WHEN EXCLUDED."Exchange" IS NULL
-                    OR UPPER(TRIM(EXCLUDED."Exchange")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
-                    THEN "Exchange"
-                ELSE EXCLUDED."Exchange"
-            END,
+                WHEN EXCLUDED."Exchange" IS NULL OR UPPER(TRIM(EXCLUDED."Exchange")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
+                    THEN "Exchange" ELSE EXCLUDED."Exchange" END,
             "IsActive" = EXCLUDED."IsActive",
             "valid_data_since" = COALESCE(EXCLUDED."valid_data_since", "valid_data_since"),
             "Description" = COALESCE(NULLIF(EXCLUDED."Description", ''), "Description")
     '''
-
-
-def _valid_update_value(value: Any) -> bool:
-    text = _optional_text(value)
-    return text is not None and text.strip().upper() not in {"UNKNOWN", "N/A", "NONE"}
-
-
-def _verify_records(records: list[dict[str, Any]]) -> None:
-    """Read back rows and check that meaningful fields really persisted."""
-    by_ticker = {record["Ticker"]: record for record in records}
-    tickers = list(by_ticker)
-    persisted: dict[str, dict[str, Any]] = {}
-
-    for offset in range(0, len(tickers), 400):
-        chunk = tickers[offset : offset + 400]
-        placeholders = ", ".join(["?"] * len(chunk))
-        query = (
-            'SELECT "Ticker", "IndicatorName", "TargetTable", "Sector", "Industry", '
-            '"AssetClass", "Exchange", "IsActive", "valid_data_since", "Description" '
-            f'FROM market_metadata WHERE "Ticker" IN ({placeholders})'
-        )
-        result = engine.execute(query, chunk).df()
-        for row in result.to_dict("records"):
-            persisted[str(row["Ticker"])] = row
-
-    missing = set(tickers) - set(persisted)
-    if missing:
+    frame = pd.DataFrame(records, columns=_METADATA_COLUMNS)
+    registered = False
+    try:
+        engine.register("temp_market_metadata_upsert", frame)
+        registered = True
+        engine.execute(query)
+    except Exception as exc:
         raise RuntimeError(
-            "market_metadata upsert did not persist ticker(s) in the ETL database: "
-            + ", ".join(sorted(missing))
-        )
+            "Failed to upsert market_metadata through the existing local DuckDB ETL engine."
+        ) from exc
+    finally:
+        if registered:
+            engine.unregister("temp_market_metadata_upsert")
 
-    # Fields explicitly sent by ETL must be visible after the write. Fields
-    # omitted/Unknown are intentionally not compared because the upsert
-    # preserves a previously known value instead of erasing it.
-    for ticker, expected in by_ticker.items():
-        actual = persisted[ticker]
-        for field in ("TargetTable", "AssetClass", "IsActive"):
-            if actual.get(field) != expected.get(field):
-                raise RuntimeError(
-                    f'market_metadata verification failed for {ticker}: '
-                    f'{field} expected {expected.get(field)!r}, found {actual.get(field)!r}'
-                )
-        for field in ("Sector", "Industry", "Exchange", "Description"):
-            if _valid_update_value(expected.get(field)) and actual.get(field) != expected.get(field):
-                raise RuntimeError(
-                    f'market_metadata verification failed for {ticker}: '
-                    f'{field} expected {expected.get(field)!r}, found {actual.get(field)!r}'
-                )
-        indicator = _optional_text(expected.get("IndicatorName"))
-        if indicator and indicator != ticker and actual.get("IndicatorName") != indicator:
-            raise RuntimeError(
-                f'market_metadata verification failed for {ticker}: '
-                f'IndicatorName expected {indicator!r}, found {actual.get("IndicatorName")!r}'
-            )
-        if expected.get("valid_data_since") is not None and actual.get("valid_data_since") != expected.get("valid_data_since"):
-            raise RuntimeError(
-                f'market_metadata verification failed for {ticker}: valid_data_since was not persisted'
-            )
+    tickers = [record["Ticker"] for record in records]
+    placeholders = ", ".join("?" for _ in tickers)
+    readback = engine.execute(
+        'SELECT ' + ", ".join(f'"{c}"' for c in _METADATA_COLUMNS)
+        + f' FROM market_metadata WHERE "Ticker" IN ({placeholders})',
+        tickers,
+    ).df()
+    _check_persisted(records, list(readback.itertuples(index=False, name=None)))
+    print(
+        f"[MARKET_METADATA] Upsert verified for {len(tickers)} ticker(s) in local ETL DuckDB: "
+        + ", ".join(tickers[:10])
+        + (" ..." if len(tickers) > 10 else "")
+    )
+    return len(records)
+
+
+def _postgres_upsert(records: list[dict[str, Any]], dsn: str) -> int:
+    columns = ", ".join(f'"{column}"' for column in _METADATA_COLUMNS)
+    placeholders = ", ".join(["%s"] * len(_METADATA_COLUMNS))
+    query = f'''
+        INSERT INTO public.market_metadata AS existing_row ({columns})
+        VALUES ({placeholders})
+        ON CONFLICT ("Ticker") DO UPDATE SET
+            "IndicatorName" = CASE
+                WHEN EXCLUDED."IndicatorName" IS NULL OR EXCLUDED."IndicatorName" = ''
+                    THEN existing_row."IndicatorName"
+                WHEN EXCLUDED."IndicatorName" = EXCLUDED."Ticker"
+                    AND existing_row."IndicatorName" IS NOT NULL AND existing_row."IndicatorName" <> ''
+                    THEN existing_row."IndicatorName"
+                ELSE EXCLUDED."IndicatorName"
+            END,
+            "TargetTable" = COALESCE(NULLIF(EXCLUDED."TargetTable", ''), existing_row."TargetTable"),
+            "Sector" = CASE
+                WHEN EXCLUDED."Sector" IS NULL OR UPPER(TRIM(EXCLUDED."Sector")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
+                    THEN existing_row."Sector" ELSE EXCLUDED."Sector" END,
+            "Industry" = CASE
+                WHEN EXCLUDED."Industry" IS NULL OR UPPER(TRIM(EXCLUDED."Industry")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
+                    THEN existing_row."Industry" ELSE EXCLUDED."Industry" END,
+            "AssetClass" = COALESCE(NULLIF(EXCLUDED."AssetClass", ''), existing_row."AssetClass"),
+            "Exchange" = CASE
+                WHEN EXCLUDED."Exchange" IS NULL OR UPPER(TRIM(EXCLUDED."Exchange")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
+                    THEN existing_row."Exchange" ELSE EXCLUDED."Exchange" END,
+            "IsActive" = EXCLUDED."IsActive",
+            "valid_data_since" = COALESCE(EXCLUDED."valid_data_since", existing_row."valid_data_since"),
+            "Description" = COALESCE(NULLIF(EXCLUDED."Description", ''), existing_row."Description")
+    '''
+    values = [tuple(record[column] for column in _METADATA_COLUMNS) for record in records]
+    tickers = [record["Ticker"] for record in records]
+    connection = None
+    try:
+        # Use the existing deployed connection string. The attachment used for
+        # analytical reads is read-only by design; this direct connection is the
+        # ETL write path to that same public table.
+        connection = psycopg2.connect(dsn, connect_timeout=20, sslmode="require")
+        with connection.cursor() as cursor:
+            cursor.executemany(query, values)
+        connection.commit()
+        with connection.cursor() as cursor:
+            cursor.execute(_SELECT_METADATA, (tickers,))
+            rows = cursor.fetchall()
+        _check_persisted(records, rows)
+    except Exception as exc:
+        if connection is not None:
+            connection.rollback()
+        error_text = str(exc)
+        if "permission denied" in error_text.lower() or "not authorized" in error_text.lower():
+            hint = " The SUPABASE_DB_URL database role needs INSERT and UPDATE privileges on public.market_metadata."
+        elif "does not exist" in error_text.lower() and "market_metadata" in error_text.lower():
+            hint = " The expected existing target is public.market_metadata in the connected Supabase project."
+        else:
+            hint = ""
+        raise RuntimeError(
+            "Supabase metadata write failed for public.market_metadata. "
+            "No local-DuckDB success is reported for this hosted write."
+            + hint + f" Database error: {error_text}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+    print(
+        f"[MARKET_METADATA] Upsert committed and read back {len(tickers)} ticker(s) "
+        f"from Supabase public.market_metadata: "
+        + ", ".join(tickers[:10])
+        + (" ..." if len(tickers) > 10 else "")
+    )
+    return len(records)
 
 
 def upsert_market_metadata(records: Iterable[dict[str, Any]]) -> int:
-    """Insert/update metadata through the existing ETL engine, then verify it.
+    """Upsert and verify metadata at the destination used in this environment.
 
-    This intentionally uses ``engine.register/execute/unregister`` just like
-    ``duckdb_upsert`` in statementScrape.py. It never routes metadata based on
-    environment variables or chooses a separate DuckDB file.
+    Local: use the existing DuckDB engine. Hosted: use SUPABASE_DB_URL to write
+    directly to the existing public.market_metadata table. This avoids writing
+    metadata to Render's ephemeral local DuckDB while downstream apps read Supabase.
     """
-    # De-duplicate in input order. The latest record for each ticker wins,
-    # avoiding DuckDB's error when one ON CONFLICT statement repeats a key.
     by_ticker: dict[str, dict[str, Any]] = {}
     for record in records:
         normalised = _normalise_record(record)
         by_ticker[normalised["Ticker"]] = normalised
-
     if not by_ticker:
         return 0
 
-    frame = pd.DataFrame(list(by_ticker.values()), columns=_METADATA_COLUMNS)
-    view_name = "temp_market_metadata_upsert"
-    registered = False
-    try:
-        engine.register(view_name, frame)
-        registered = True
-        engine.execute(_metadata_upsert_sql())
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to upsert market_metadata through the same DuckDB engine used by statement tables. "
-            "The ETL cannot claim metadata was updated."
-        ) from exc
-    finally:
-        if registered:
-            try:
-                engine.unregister(view_name)
-            except Exception as cleanup_exc:
-                raise RuntimeError(
-                    "Metadata upsert ran, but the DuckDB temporary view/connection could not be closed."
-                ) from cleanup_exc
-
-    tickers = list(by_ticker)
-    _verify_records(list(by_ticker.values()))
-    print(
-        f"[MARKET_METADATA] Upsert verified for {len(tickers)} ticker(s) "
-        f"using ETL database: {', '.join(tickers[:10])}"
-        + (" ..." if len(tickers) > 10 else "")
-    )
-    return len(tickers)
+    normalised_records = list(by_ticker.values())
+    dsn = os.getenv("SUPABASE_DB_URL", "").strip()
+    if dsn:
+        return _postgres_upsert(normalised_records, dsn)
+    return _duckdb_upsert(normalised_records)
 
 
 def fetch_active_global_assets() -> pd.DataFrame:
-    """Read active assets through the same engine that owns the ETL database."""
-    result = engine.execute(
-        '''
+    """Read active assets from the same destination that receives metadata writes."""
+    dsn = os.getenv("SUPABASE_DB_URL", "").strip()
+    if dsn:
+        connection = None
+        try:
+            connection = psycopg2.connect(dsn, connect_timeout=20, sslmode="require")
+            with connection.cursor() as cursor:
+                cursor.execute('''
+                    SELECT "Ticker", "AssetClass", "Exchange"
+                    FROM public.market_metadata
+                    WHERE "IsActive" = TRUE
+                    ORDER BY "Ticker"
+                ''')
+                rows = cursor.fetchall()
+            return pd.DataFrame(rows, columns=["Ticker", "AssetClass", "Exchange"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to read active global assets from Supabase public.market_metadata: "
+                + str(exc)
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+    return engine.execute('''
         SELECT "Ticker", "AssetClass", "Exchange"
         FROM market_metadata
         WHERE "IsActive" = TRUE
         ORDER BY "Ticker"
-        '''
-    ).df()
-    return result
+    ''').df()
