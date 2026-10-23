@@ -662,7 +662,8 @@ def update_company_profile(ticker: str):
                 "Sector" = EXCLUDED."Sector",
                 "Industry" = EXCLUDED."Industry",
                 "IndicatorName" = EXCLUDED."IndicatorName",
-                "Exchange" = EXCLUDED."Exchange";
+                "Exchange" = EXCLUDED."Exchange",
+                "IsActive" = EXCLUDED."IsActive";
         """)
 
         engine.unregister("temp_profile_meta")
@@ -672,12 +673,13 @@ def update_company_profile(ticker: str):
         )
 
     except Exception as e:
-        print(f"[{ticker}] Warning: Failed to sync company profile: {e}")
+        print(f"[{ticker}] ERROR: Failed to sync company profile to market_metadata: {e}")
         # Safeguard to clear internal catalog registration in case of runtime failure
         try:
             engine.unregister("temp_profile_meta")
         except Exception:
             pass
+        raise RuntimeError(f"[{ticker}] market_metadata update failed; stopping ETL") from e
 
 
 def clean_financial_dataframe(df):
@@ -1765,6 +1767,9 @@ def run_etl_pipeline(target_tickers, ai_mode="local", requested_source="auto"):
             print(f"local")
 
         for ticker in target_tickers:
+            # Keep market metadata current even when statement fetches fail.
+            update_company_profile(ticker)
+
             # FETCH UNIFIED PAYLOAD
             payload = fetch_all_financials(ticker, requested_source)
 
@@ -1783,7 +1788,6 @@ def run_etl_pipeline(target_tickers, ai_mode="local", requested_source="auto"):
 
             source = payload["source"]
             data = payload["data"]
-            update_company_profile(ticker)
             # UNPACK TO DATAFRAMES
             print(f"[{ticker}] Formatting DataFrames for {source}...")
 
