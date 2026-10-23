@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert
 # from scripts.reconciliation import extract_mapped_keys, execute_three_way_match
 # from scripts.ai_agent import trigger_semantic_router
 from scripts.database import engine
+from scripts.market_metadata import upsert_market_metadata
 
 # from scripts.reconciliation import extract_mapped_keys, execute_three_way_match
 from sqlalchemy import text
@@ -595,92 +596,59 @@ def fetch_all_financials(ticker, requested_source="auto"):
 
 
 def update_company_profile(ticker: str):
-    try:
-        # Try the base ticker first, then append .NS if it fails or lacks sector data
+    """Upsert ticker metadata to the same store downstream ETL reads."""
+    ticker = str(ticker or "").strip()
+    if not ticker:
+        raise ValueError("Cannot update market_metadata for an empty ticker")
+
+    # Profile lookup enriches metadata but must not control whether the ticker is
+    # registered. A provider outage still leaves a basic, active metadata row.
+    if ticker.endswith((".NS", ".BO")):
+        base_ticker = ticker.rsplit(".", 1)[0]
+        tickers_to_try = [ticker, base_ticker]
+    else:
         tickers_to_try = [ticker, f"{ticker}.NS"]
 
-        info = {}
-        for t in tickers_to_try:
-            try:
-                temp_info = yf.Ticker(t).info
-                if (
-                    temp_info
-                    and temp_info.get("sector")
-                    and temp_info.get("sector") != "Unknown"
-                ):
-                    info = temp_info
-                    if t != ticker:
-                        print(f"[{ticker}] Found profile using fallback ticker: {t}")
-                    break
-            except Exception:
-                continue
-
-        # Fallback if both attempts fail to yield a populated dictionary
-        if not info:
-            try:
-                info = yf.Ticker(ticker).info
-            except Exception:
-                info = {}
-
-        # Extract data with safe fallbacks
-        sector = info.get("sector", "Unknown")
-        industry = info.get("industry", "Unknown")
-        exchange = info.get("exchange", "Unknown")
-        company_name = info.get("shortName", ticker)
-
-        # Fix Exchange mapping constraint: Convert NSI to NSE
-        if exchange == "NSI":
-            exchange = "NSE"
-
-        # Replaced SQLAlchemy Core Upsert with DuckDB-compatible native mechanics
-        df_single = pd.DataFrame(
-            [
-                {
-                    "Ticker": ticker,
-                    "IndicatorName": company_name,
-                    "TargetTable": "market_pricing_daily",  # Required non-nullable field
-                    "Sector": sector,
-                    "Industry": industry,
-                    "AssetClass": "Equity",  # Required non-nullable field
-                    "Exchange": exchange,
-                    "IsActive": True,
-                }
-            ]
-        )
-
-        engine.register("temp_profile_meta", df_single)
-
-        engine.execute("""
-            INSERT INTO market_metadata (
-                "Ticker", "IndicatorName", "TargetTable", "Sector", "Industry", "AssetClass", "Exchange", "IsActive"
-            )
-            SELECT 
-                "Ticker", "IndicatorName", "TargetTable", "Sector", "Industry", "AssetClass", "Exchange", "IsActive" 
-            FROM temp_profile_meta
-            ON CONFLICT ("Ticker") 
-            DO UPDATE SET 
-                "Sector" = EXCLUDED."Sector",
-                "Industry" = EXCLUDED."Industry",
-                "IndicatorName" = EXCLUDED."IndicatorName",
-                "Exchange" = EXCLUDED."Exchange",
-                "IsActive" = EXCLUDED."IsActive";
-        """)
-
-        engine.unregister("temp_profile_meta")
-
-        print(
-            f"[{ticker}] Profile Synced -> Sector: {sector} | Industry: {industry} | Exchange: {exchange}"
-        )
-
-    except Exception as e:
-        print(f"[{ticker}] ERROR: Failed to sync company profile to market_metadata: {e}")
-        # Safeguard to clear internal catalog registration in case of runtime failure
+    info = {}
+    for candidate in tickers_to_try:
         try:
-            engine.unregister("temp_profile_meta")
-        except Exception:
-            pass
-        raise RuntimeError(f"[{ticker}] market_metadata update failed; stopping ETL") from e
+            candidate_info = yf.Ticker(candidate).info or {}
+            if candidate_info and not info:
+                info = candidate_info
+            sector = candidate_info.get("sector")
+            if sector and str(sector).strip().lower() not in {"unknown", "none", "n/a"}:
+                info = candidate_info
+                break
+        except Exception as exc:
+            print(f"[{ticker}] Profile lookup failed for {candidate}: {exc}")
 
+    raw_exchange = str(info.get("exchange") or "Unknown").strip().upper()
+    exchange_map = {
+        "NSI": "NSE", "NSE": "NSE", "BSE": "BSE", "BOM": "BSE",
+        "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ", "NASDAQ": "NASDAQ",
+        "NYQ": "NYSE", "NYSE": "NYSE",
+    }
+    exchange = exchange_map.get(raw_exchange, raw_exchange if raw_exchange != "UNKNOWN" else "Unknown")
+    company_name = info.get("shortName") or info.get("longName") or ticker
+
+    record = {
+        "Ticker": ticker,
+        "IndicatorName": company_name,
+        "TargetTable": "global_assets",
+        "Sector": info.get("sector"),
+        "Industry": info.get("industry"),
+        "AssetClass": "Equity",
+        "Exchange": exchange,
+        "IsActive": True,
+        "Description": "Company metadata synchronized by statement ETL",
+    }
+    try:
+        updated = upsert_market_metadata([record])
+    except Exception as exc:
+        print(f"[{ticker}] ERROR: market_metadata write failed: {exc}")
+        raise RuntimeError(f"[{ticker}] market_metadata update failed; stopping ETL") from exc
+
+    print(f"[{ticker}] market_metadata synced ({updated} row; exchange={exchange}).")
 
 def clean_financial_dataframe(df):
 
@@ -1767,7 +1735,7 @@ def run_etl_pipeline(target_tickers, ai_mode="local", requested_source="auto"):
             print(f"local")
 
         for ticker in target_tickers:
-            # Keep market metadata current even when statement fetches fail.
+            # Update registry first; a failed statement fetch must not skip metadata.
             update_company_profile(ticker)
 
             # FETCH UNIFIED PAYLOAD

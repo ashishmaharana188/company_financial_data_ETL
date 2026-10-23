@@ -2,85 +2,67 @@ import yfinance as yf
 import pandas as pd
 from tvDatafeed import TvDatafeed, Interval
 from scripts.database import engine
+from scripts.market_metadata import upsert_market_metadata, fetch_active_global_assets
 import time
 from datetime import datetime
 
 
 def register_discovered_tickers(tickers, data_source="auto"):
+    """Persist discovered tickers in the metadata store used by downstream jobs."""
     if not tickers:
-        return
+        return 0
 
-    print(f"\\nRegistering discovered client tickers from {data_source.upper()}...")
+    print(f"\nRegistering discovered client tickers from {data_source.upper()}...")
     records = []
+    for value in tickers:
+        ticker = str(value or "").strip().upper()
+        if not ticker:
+            continue
 
-    for ticker in tickers:
-        if data_source in ["screener", "indianapi"]:
-            exchange = "NSE"
-        elif ticker.endswith(".NS"):
+        if data_source in ["screener", "indianapi"] or ticker.endswith(".NS"):
             exchange = "NSE"
         elif ticker.endswith(".BO"):
             exchange = "BSE"
         else:
-            # FIX: TradingView explicitly requires NASDAQ/NYSE, not generic "US"
             try:
-                raw_exchange = yf.Ticker(ticker).info.get("exchange", "NASDAQ")
-                if "NASDAQ" in raw_exchange.upper():
-                    exchange = "NASDAQ"
-                elif "NYSE" in raw_exchange.upper():
-                    exchange = "NYSE"
-                else:
-                    exchange = "NASDAQ"
+                raw_exchange = str(yf.Ticker(ticker).info.get("exchange", "NASDAQ")).upper()
+                exchange = (
+                    "NSE" if raw_exchange in {"NSI", "NSE"}
+                    else "BSE" if raw_exchange in {"BSE", "BOM"}
+                    else "NYSE" if raw_exchange in {"NYQ", "NYSE"}
+                    else "NASDAQ"
+                )
             except Exception:
                 exchange = "NASDAQ"
 
-        records.append(
-            {
-                "Ticker": ticker,
-                "IndicatorName": ticker,
-                "TargetTable": "global_assets",
-                "AssetClass": "Equity",
-                "Exchange": exchange,
-                "IsActive": True,
-                "Description": f"Auto-discovered via {data_source.upper()} ETL",
-            }
-        )
+        records.append({
+            "Ticker": ticker,
+            "IndicatorName": ticker,
+            "TargetTable": "global_assets",
+            "Sector": None,
+            "Industry": None,
+            "AssetClass": "Equity",
+            "Exchange": exchange,
+            "IsActive": True,
+            "Description": f"Auto-discovered via {data_source.upper()} ETL",
+        })
 
-    # DUCKDB FIX: Replaced iterative text query with Native Zero-Copy Upsert
-    df_meta = pd.DataFrame(records)
-    try:
-        engine.register("temp_macro_meta", df_meta)
-        engine.execute(
-            """
-            INSERT INTO market_metadata ("Ticker", "IndicatorName", "TargetTable", "AssetClass", "Exchange", "IsActive", "Description")
-            SELECT "Ticker", "IndicatorName", "TargetTable", "AssetClass", "Exchange", "IsActive", "Description" FROM temp_macro_meta
-            ON CONFLICT ("Ticker") 
-            DO UPDATE SET 
-                "Exchange" = EXCLUDED."Exchange",
-                "Description" = EXCLUDED."Description";
-        """
-        )
-        engine.unregister("temp_macro_meta")
-        print(f"SUCCESS: {len(records)} client tickers verified in market_metadata.")
-    except Exception as e:
-        print(f"    [ERROR] Failed to register tickers: {e}")
+    if not records:
+        return 0
+    count = upsert_market_metadata(records)
+    print(f"SUCCESS: {count} ticker(s) synced to market_metadata.")
+    return count
 
 
 def get_active_global_assets():
-    query = """
-        SELECT "Ticker", "AssetClass", "Exchange"
-        FROM market_metadata 
-        WHERE "IsActive" = true; 
-    """
+    """Read the registry from the same data store that receives metadata writes."""
     try:
-        with engine.stream_lazy(query) as stream:
-            # FIX: RecordBatchReader requires read_pandas()
-            return stream.reader.read_pandas()
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch equities from DB: {e}")
-        import pandas as pd
-
-        return pd.DataFrame()
-
+        assets = fetch_active_global_assets()
+    except Exception as exc:
+        print(f"[ERROR] Failed to fetch active global assets from market_metadata: {exc}")
+        raise
+    print(f"Loaded {len(assets)} active global asset(s) from market_metadata.")
+    return assets
 
 def get_yf_period(interval):
     if interval == "1m":
