@@ -177,46 +177,98 @@ def _duckdb_upsert(records: list[dict[str, Any]]) -> int:
     return len(records)
 
 
+def _merge_existing_metadata(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge fresh metadata without erasing previously useful profile fields."""
+    merged = dict(existing)
+    ticker = incoming["Ticker"]
+
+    incoming_indicator = _optional_text(incoming.get("IndicatorName"))
+    existing_indicator = _optional_text(existing.get("IndicatorName"))
+    if not incoming_indicator or (
+        incoming_indicator == ticker
+        and existing_indicator
+        and existing_indicator != ticker
+    ):
+        merged["IndicatorName"] = existing.get("IndicatorName")
+    else:
+        merged["IndicatorName"] = incoming_indicator
+
+    for field in ("TargetTable", "AssetClass"):
+        merged[field] = _optional_text(incoming.get(field)) or existing.get(field)
+
+    for field in ("Sector", "Industry", "Exchange"):
+        value = incoming.get(field)
+        merged[field] = value if _usable(value) else existing.get(field)
+
+    # Activity is intentional state, so always accept its current value.
+    merged["IsActive"] = incoming["IsActive"]
+    merged["valid_data_since"] = (
+        incoming.get("valid_data_since")
+        if incoming.get("valid_data_since") is not None
+        else existing.get("valid_data_since")
+    )
+    merged["Description"] = (
+        _optional_text(incoming.get("Description"))
+        or existing.get("Description")
+    )
+    merged["Ticker"] = ticker
+    return merged
+
+
 def _postgres_upsert(records: list[dict[str, Any]], dsn: str) -> int:
+    """Write to Supabase without relying on a UNIQUE constraint on Ticker.
+
+    The existing Supabase table does not have a matching unique/exclusion
+    constraint for Ticker. Serialize this writer with an advisory transaction
+    lock, then UPDATE matching rows or INSERT when none exists. No schema change
+    is required. If legacy duplicate tickers exist, UPDATE all matching rows
+    rather than creating more.
+    """
     columns = ", ".join(f'"{column}"' for column in _METADATA_COLUMNS)
-    placeholders = ", ".join(["%s"] * len(_METADATA_COLUMNS))
-    query = f'''
-        INSERT INTO public.market_metadata AS existing_row ({columns})
-        VALUES ({placeholders})
-        ON CONFLICT ("Ticker") DO UPDATE SET
-            "IndicatorName" = CASE
-                WHEN EXCLUDED."IndicatorName" IS NULL OR EXCLUDED."IndicatorName" = ''
-                    THEN existing_row."IndicatorName"
-                WHEN EXCLUDED."IndicatorName" = EXCLUDED."Ticker"
-                    AND existing_row."IndicatorName" IS NOT NULL AND existing_row."IndicatorName" <> ''
-                    THEN existing_row."IndicatorName"
-                ELSE EXCLUDED."IndicatorName"
-            END,
-            "TargetTable" = COALESCE(NULLIF(EXCLUDED."TargetTable", ''), existing_row."TargetTable"),
-            "Sector" = CASE
-                WHEN EXCLUDED."Sector" IS NULL OR UPPER(TRIM(EXCLUDED."Sector")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
-                    THEN existing_row."Sector" ELSE EXCLUDED."Sector" END,
-            "Industry" = CASE
-                WHEN EXCLUDED."Industry" IS NULL OR UPPER(TRIM(EXCLUDED."Industry")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
-                    THEN existing_row."Industry" ELSE EXCLUDED."Industry" END,
-            "AssetClass" = COALESCE(NULLIF(EXCLUDED."AssetClass", ''), existing_row."AssetClass"),
-            "Exchange" = CASE
-                WHEN EXCLUDED."Exchange" IS NULL OR UPPER(TRIM(EXCLUDED."Exchange")) IN ('', 'UNKNOWN', 'N/A', 'NONE')
-                    THEN existing_row."Exchange" ELSE EXCLUDED."Exchange" END,
-            "IsActive" = EXCLUDED."IsActive",
-            "valid_data_since" = COALESCE(EXCLUDED."valid_data_since", existing_row."valid_data_since"),
-            "Description" = COALESCE(NULLIF(EXCLUDED."Description", ''), existing_row."Description")
-    '''
-    values = [tuple(record[column] for column in _METADATA_COLUMNS) for record in records]
+    value_placeholders = ", ".join(["%s"] * len(_METADATA_COLUMNS))
+    update_columns = [column for column in _METADATA_COLUMNS if column != "Ticker"]
+    update_assignments = ", ".join(f'"{column}" = %s' for column in update_columns)
+    insert_sql = (
+        f"INSERT INTO public.market_metadata ({columns}) "
+        f"VALUES ({value_placeholders})"
+    )
+    update_sql = (
+        f"UPDATE public.market_metadata SET {update_assignments} "
+        'WHERE "Ticker" = %s'
+    )
+
     tickers = [record["Ticker"] for record in records]
+    inserted = 0
+    updated = 0
     connection = None
     try:
-        # Use the existing deployed connection string. The attachment used for
-        # analytical reads is read-only by design; this direct connection is the
-        # ETL write path to that same public table.
+        # Use the existing deployed connection string. This lock coordinates
+        # this ETL's metadata writers and does not require schema/role changes.
         connection = psycopg2.connect(dsn, connect_timeout=20, sslmode="require")
         with connection.cursor() as cursor:
-            cursor.executemany(query, values)
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (824274110013,))
+
+            for record in records:
+                cursor.execute(
+                    f'SELECT {columns} FROM public.market_metadata '
+                    'WHERE "Ticker" = %s LIMIT 1',
+                    (record["Ticker"],),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    values = tuple(record[column] for column in _METADATA_COLUMNS)
+                    cursor.execute(insert_sql, values)
+                    inserted += max(cursor.rowcount, 0)
+                    continue
+
+                existing = dict(zip(_METADATA_COLUMNS, row))
+                merged = _merge_existing_metadata(existing, record)
+                values = tuple(merged[column] for column in update_columns)
+                cursor.execute(update_sql, values + (record["Ticker"],))
+                updated += max(cursor.rowcount, 0)
+
         connection.commit()
         with connection.cursor() as cursor:
             cursor.execute(_SELECT_METADATA, (tickers,))
@@ -227,14 +279,14 @@ def _postgres_upsert(records: list[dict[str, Any]], dsn: str) -> int:
             connection.rollback()
         error_text = str(exc)
         if "permission denied" in error_text.lower() or "not authorized" in error_text.lower():
-            hint = " The SUPABASE_DB_URL database role needs INSERT and UPDATE privileges on public.market_metadata."
+            hint = " The SUPABASE_DB_URL database role needs SELECT, INSERT, and UPDATE privileges on public.market_metadata."
         elif "does not exist" in error_text.lower() and "market_metadata" in error_text.lower():
             hint = " The expected existing target is public.market_metadata in the connected Supabase project."
         else:
             hint = ""
         raise RuntimeError(
             "Supabase metadata write failed for public.market_metadata. "
-            "No local-DuckDB success is reported for this hosted write."
+            "The writer uses UPDATE/INSERT and does not require a unique constraint on Ticker."
             + hint + f" Database error: {error_text}"
         ) from exc
     finally:
@@ -242,8 +294,8 @@ def _postgres_upsert(records: list[dict[str, Any]], dsn: str) -> int:
             connection.close()
 
     print(
-        f"[MARKET_METADATA] Upsert committed and read back {len(tickers)} ticker(s) "
-        f"from Supabase public.market_metadata: "
+        f"[MARKET_METADATA] Supabase public.market_metadata verified: "
+        f"{len(tickers)} ticker(s), {inserted} inserted, {updated} updated: "
         + ", ".join(tickers[:10])
         + (" ..." if len(tickers) > 10 else "")
     )
