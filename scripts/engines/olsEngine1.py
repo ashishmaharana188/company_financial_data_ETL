@@ -70,16 +70,16 @@ class OLSMicrostructureEngine:
     # ------------------------------------------------------------------
     @staticmethod
     def _read_polars(query: str, params: Optional[dict] = None) -> pl.DataFrame:
-        """Execute an OLAP query directly and return a Polars DataFrame."""
+        """Execute an OLAP query and return Polars using the current DuckDB API.
+
+        ``connection.execute`` returns the connection itself. In newer DuckDB
+        releases, that object no longer exposes ``pl()`` or
+        ``fetch_arrow_table()``. Use ``connection.sql`` to create a relation,
+        then materialize through its supported Arrow conversion.
+        """
         with duckdb.connect(DB_PATH, read_only=True) as con:
-            if params:
-                result = con.execute(query, params)
-            else:
-                result = con.execute(query)
-            try:
-                return result.pl()
-            except AttributeError:
-                return pl.from_arrow(result.fetch_arrow_table())
+            relation = con.sql(query, params=params or {})
+            return pl.from_arrow(relation.to_arrow_table())
 
     @staticmethod
     def _read_scalar(query: str, params: Optional[dict] = None):
